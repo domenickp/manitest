@@ -12,9 +12,9 @@ module Constants
     logdir         = /var/log/puppet
     rundir         = /var/run/puppet
     ssldir         = $vardir/ssl
-    templatedir    = /etc/puppet/templates
+    templatedir    = $vardir/templates
+    statedir       = $vardir/state
     node_terminus  = plain
-    statedir       = /var/lib/puppet/state
     noop           = true
 [puppet]
     localconfig    = $vardir/localconfig
@@ -45,6 +45,10 @@ optparse = OptionParser.new do |opts|
   opts.on( '-e', '--environment ENV', 'Override node environment' ) do |env|
     options[:environment] = env
   end
+  options[:confdir] = "/etc/puppet"
+  opts.on( '-c', '--confdir DIR', 'Where to find puppet config - defaults to /etc/puppet' ) do |dir|
+    options[:confdir] = dir
+  end
   options[:tmpdir] = "/tmp/"
   opts.on( '-t', '--tmpdir DIR', 'Where to write temp files - defaults to /tmp' ) do |tmp|
     options[:tmpdir] = tmp
@@ -54,14 +58,6 @@ optparse = OptionParser.new do |opts|
   options[:node] = ""
   opts.on( '-n', '--node FILE', 'YAML node file to use' ) do |file|
     options[:node] = file
-  end
-  options[:pclasses] = []
-  opts.on( '-c', '--class CLASSA,CLASSB', 'node classes to use' ) do |c|
-    options[:pclasses] = c.split(",")
-  end
-  options[:manifest] = "/etc/puppet/manifests/site.pp"
-  opts.on( '-m', '--manifest FILE', "manifest file to use - defaults to #{options[:manifest]}" ) do |file|
-    options[:manifest] = file
   end
 
   opts.on( '-h', '--help', 'Display this screen' ) do
@@ -84,19 +80,12 @@ end
 
 # load puppet infrastructure only after we've got some command line arguments
 require 'puppet'
-Puppet[:config] = "/etc/puppet/puppet.conf"
+Puppet[:config] = "#{options[:confdir]}/puppet.conf"
 Puppet.parse_config
 
 node = YAML.load_file options[:node]
 unless node.is_a?(Puppet::Node)
   warn "Invalid node file - you should use something from /var/lib/puppet/yaml/node directory"
-  exit 1
-end
-
-klasses = options[:pclasses].size == 0 ? node.classes :  options[:pclasses]
-
-if klasses.size == 0
-  warn "Your node file does not contain classes, add some or specify them in the command line"
   exit 1
 end
 
@@ -128,6 +117,7 @@ end
 
 # if no module path is defined, use the default one
 modulepath = Puppet.settings[:modulepath] if modulepath.nil? or modulepath.empty?
+modulepath = "#{options[:confdir]}/modules"
 
 # Set the dummy puppet.conf
 puppet_conf  = Constants::Puppet_conf_tmpl.dup
@@ -135,28 +125,29 @@ puppet_conf << "\tmodulepath   = #{modulepath}\n"
 
 # Write out a puppet.conf and a node.conf.
 conf = Pathname.new(options[:tmpdir]) + ".tmp_puppet.conf"
-nodefile = Pathname.new(options[:tmpdir]) + ".tmp_node.pp"
+nodefile = options[:confdir] + "/manifests/site.pp"
 conf.open(File::CREAT|File::WRONLY|File::TRUNC) {|f| f.write puppet_conf}
-nodefile.open(File::CREAT|File::WRONLY|File::TRUNC) do |f|
-  f.puts "node '#{node.name}' {"
-  f.puts "import '#{options[:manifest]}'"
-  klasses.each do |c|
-    f.puts "\tinclude #{c}"
-  end
-  f.puts "}"
-end
 
-cmd = "/usr/bin/puppet --environment #{environment} --config #{conf} --certname #{node.name} --debug #{nodefile} 2>&1"
+cmd = "/usr/bin/puppet --environment #{environment} --config #{conf} --certname #{node.name} --debug --color false #{nodefile} 2>&1"
 puts cmd if options[:debug]
-report = []
+default_schedule = false
 status = "broken"
 IO.popen(cmd) do |puppet|
   while not puppet.eof?
     line = puppet.readline
-    report << line
-    puts line if options[:debug]
-    if line=~/Finishing transaction/ and report[-2]=~/Creating default schedules/
+    if options[:debug]
+      puts line
+    elsif line !~ /^(debug|info|notice):/
+      # this should be an error message
+      puts line
+    end
+    if line =~ /Creating default schedules/
+      default_schedule = true
+    end
+    if line =~ /Finishing transaction/ and default_schedule
       status = "OK"
+      break
+    elsif line =~ /Finishing transaction/
       break
     end
   end
@@ -165,5 +156,4 @@ if options[:verbose] or  options[:debug]
   puts "The manifest compilation for #{node.name} is #{status}"
 end
 conf.unlink unless options[:debug]
-nodefile.unlink unless options[:debug]
 exit(status == "OK" ? 0 : -1)
